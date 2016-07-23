@@ -1,0 +1,119 @@
+#+OPTIONS: num:t todo:nil tasks:nil
+#+OPTIONS: toc:nil
+#+OPTIONS: H:4
+#+TITLE: AFL data scraping
+#+AUTHOR: Stephen E Lane
+
+#+HTML_MATHJAX: align: left tagindent: 5em tagside: right font: Neo-Euler
+
+#+TOC: headlines 2
+
+* Introduction
+
+I've been interested in looking at some AFL data more in depth. Both for interest, and for team and player projects. Here I show how to get the data from the AFL website.
+
+* Get the data
+
+We can use the ~httr~ package to make an AJAX request to the AFL website. The data comes back in JSON format, so we'll use the ~jsonlite~ package to turn it into a data frame. Because requests are made using AJAX, you'll need a token, which you can get from the AFL website, using e.g. chrome developer tools. Now, the format below makes use of ~roxygen2~ for in-source documentation:
+
+#+BEGIN_SRC R :session :exports code :results output :tangle ../R/getAFL.R
+  #' Get AFL data
+  #'
+  #' \code{getAFL} connects to the AFL data website and downloads a full year's
+  #' game-by-game statistics. The results are saved to the \code{data-raw}
+  #' folder.
+  #'
+  #' @param year The year to get data for.
+  #' @param nRounds The number of rounds in that year (allows for different number
+  #'     of rounds due to extra teams etc.)
+  #' @param token \code{X-media-mis-token} token. Requests are made using AJAX, so
+  #'     to connect successfully, this token is required. You can get this during
+  #'     a current session on the AFL data website, using e.g. chrome developer
+  #'     tools.
+  #' @export getAFL
+
+  getAFL <- function(year, nRounds, token){
+      baseURL <-
+          "http://www.afl.com.au/api/cfs/afl/statsCentre/teams?competitionId=CD_S%s014&roundId=CD_R%s014%s"
+      rounds <- c(paste0("0", 1:9), 10:nRounds)
+      ## Grab the results
+      results <- lapply(1:nRounds, function(x){
+          fullURL <- sprintf(baseURL, as.character(year), as.character(year),
+                             rounds[x])
+          res <- httr::GET(fullURL, httr::add_headers(`X-media-mis-token` = token))
+          res <- jsonlite::fromJSON(httr::content(res, "text"))[[1]]
+          avg <- res$stats$averages
+          names(avg) <- paste0("average.", names(avg))
+          res <- cbind(avg, res$stats$totals, res$team)
+          res$home.away <- rep(c("Home", "Away"), nrow(res)/2)
+          res$round <- as.integer(rounds[x])
+          res$season <- as.integer(year)
+          res
+      })
+      results
+  }
+#+END_SRC
+
+The data are now stored in as a list of data frames. Unfortunately, within the data frames themselves, clearances (and interchanges) are stored as data frames! Let's tidy that up so we have data frames, and then save again.
+
+#+BEGIN_SRC R :session :exports both :results output
+  fixData <- function(year){
+      txt <- sprintf("load('../data-raw/results-year-%d.rda')", year)
+      eval(parse(text = txt))
+      eval(parse(text = sprintf("dat <- results%d", year)))
+      out <- lapply(dat, function(x){
+          x2 <- dplyr::select(x, contains("clearances"))
+          x <- dplyr::select(x, -contains("clearances"), -contains("interchange"))
+          x2 <- cbind(x2$average.clearances, x2$clearances)
+          names(x2)[1:3] <- paste0("average.", names(x2)[1:3])
+          x <- dplyr::as_data_frame(dplyr::bind_cols(x, x2))
+          x
+      })
+      out2 <- dplyr::bind_rows(out)
+      eval(parse(text = sprintf("results%d <- out2", year)))
+      txt <- sprintf("save(results%d, file = '../data-raw/results-year-%d.rda')",
+                     year, year)
+      eval(parse(text = txt))
+      return(NULL)
+  }
+#+END_SRC
+
+OK, so the data for each year are tidied up. Now we can start doing things. It's a little tricky to start thinking about how best to structure the data though. It's also difficult to think about how to model.
+
+- If I was setting up a regression, would I do this on a game-by-game basis, with only one margin? I think so. I would need to have home and away versions of predictors, as well as an identifier as to which team was home, and which was away.
+- If I was to set up an Elo rating system, how then would I best structure the data?
+  - Different equations apply for each team?
+
+* Munging the data
+
+Let's now turn our attention to putting the data into a more useful format. For modelling (and Elo) purposes, I think I will need to have one line per game, per round. The simplest way to achieve this, will be to take one rounds worth of data, filter into two datasets: home and away, rename the variables in each (home/away), then bind them together. Rinse and repeat. The function below will do this.
+
+#+BEGIN_SRC R :session :exports both :results output
+  rndWide <- function(data){
+      rHome <- data %>% filter(home.away == "Home")
+      names(rHome) <- paste0(names(rHome), "Home")
+      rAway <- data %>% filter(home.away == "Away")
+      names(rAway) <- paste0(names(rAway), "Away")
+      rWide <- bind_cols(rHome, rAway) %>%
+          mutate(pointsHome = goalsHome*6 + behindsHome,
+                 pointsAway = goalsAway*6 + behindsAway,
+                 margin = pointsHome - pointsAway
+                 )
+      rWide
+  }
+#+END_SRC
+
+Ok, so we might as well go through and do this for each season. Then we can start looking at playing around with the data!
+
+#+BEGIN_SRC R :exports code :results output
+  for(i in 2001:2016){
+      nmF <- sprintf("../data-raw/results-year-%d.rda", i)
+      nmD <- sprintf("results%d", i)
+      eval(parse(text = paste0("load(\"", nmF, "\")")))
+      eval(parse(text = paste0("res <- ", nmD)))
+      byRnd <- res %>% group_by(round) %>%
+          do(rndWide(.))
+      eval(parse(text = paste0(nmD, " <- byRnd")))
+      eval(parse(text = paste0("save(", nmD, ", file = \"", nmF, "\")")))
+  }
+#+END_SRC

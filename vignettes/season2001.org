@@ -1,0 +1,69 @@
+#+OPTIONS: num:t todo:nil tasks:nil
+#+OPTIONS: toc:nil
+#+OPTIONS: H:4
+#+TITLE: Analysis of season 2001 AFL data
+#+AUTHOR: Stephen E Lane
+
+#+HTML_MATHJAX: align: left tagindent: 5em tagside: right font: Neo-Euler
+
+#+TOC: headlines 2
+
+* Introduction
+
+I've been interested in looking at some AFL data more in depth. Both for interest, and for team and player projects. Here I show how to get the data from the AFL website.
+
+Now let's look at the 2001 data.
+
+#+BEGIN_SRC R :session :exports both :results output
+  library(dplyr)
+  library(ggplot2)
+  library(directlabels)
+  load("../data-raw/results-year-2001.rda")
+  r1 <- results2001 %>% filter(round == 1)
+
+  calcElo <- function(rndData, oldRating, K, ha = 0){
+      rndData <- rndData %>%
+          mutate(
+              rOldHome = with(oldRating %>%
+                              filter(team %in% rndData$teamNameHome,
+                                     oldRating$round == rndData$round[1] - 1),
+                              rating),
+              rOldAway = with(oldRating %>%
+                              filter(team %in% rndData$teamNameAway,
+                                     oldRating$round == rndData$round[1] - 1),
+                              rating),
+              diffRateHome = rOldHome - rOldAway + ha,
+              diffRateAway = rOldAway - rOldHome,
+              expWinHome = 1/(10^(-diffRateHome/400) + 1),
+              expWinAway = 1 - expWinHome,
+              winHome = ifelse(pointsHome - pointsAway == 0, 0.5,
+                        ifelse(pointsHome - pointsAway > 0, 1, 0)),
+              winAway = 1 - winHome,
+              rNewHome = rOldHome + K * (winHome - expWinHome),
+              rNewAway = rOldAway + K * (winAway - expWinAway)
+          )
+      ## Then put back into a stacked (tidy) data frame.
+      nextRating <- with(rndData,
+                         data_frame(round = rep(round, 2),
+                                    team = c(teamNameHome, teamNameAway),
+                                    rating = c(rNewHome, rNewAway)))
+      nextRating
+  }
+
+  ## Model up to end of home and away.
+  ratings <- data_frame(team = unique(results2001$teamNameHome),
+                        rating = 1300,
+                        round = 0
+                        )
+  for(i in 1:22){
+      rnd <- results2001 %>% filter(round == i)
+      newRating <- calcElo(rnd, oldRating = ratings, K = 5)
+      ratings <- bind_rows(ratings, newRating)
+      message(paste0("Rated rounds 0 to ", i))
+  }
+
+  plt <- ggplot(ratings, aes(x = round, y = rating, colour = team)) +
+      geom_line() +
+      scale_colour_discrete(guide = "none") +
+      geom_dl(aes(label = team), method = "last.bumpup")
+#+END_SRC
