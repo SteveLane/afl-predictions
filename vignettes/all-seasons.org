@@ -1,0 +1,325 @@
+#+OPTIONS: num:t todo:nil tasks:nil
+#+OPTIONS: toc:nil
+#+OPTIONS: H:4
+#+TITLE: Analysis of all seasons AFL data
+#+AUTHOR: Stephen E Lane
+
+#+HTML_MATHJAX: align: left tagindent: 5em tagside: right font: Neo-Euler
+
+#+TOC: headlines 2
+
+* Introduction
+
+So in [[file:season2001.org][season 2001]] I looked at a function to optimise the home ground advantage and smoothing parameter for a very simple Elo-style ratings system. Now, it'd be much more interesting if I could do this over all seasons.
+
+Now let's look at the 2001 data:
+
+#+BEGIN_SRC R :session :exports both :results output
+  library(dplyr)
+  library(ggplot2)
+  library(directlabels)
+  library(optimx)
+  load("../data-raw/results-year-2001.rda")
+#+END_SRC
+
+* Optimising over all the data
+
+I have an optimising function from [[file:season2001.org][season 2001]] so I just need to fiddle with that. What's a good prototype/pseudocode for this? How about:
+
+- read in 2001
+- start everyone off with the same ratings
+- run through the season to get final ratings
+- store the aggregated error
+
+OK now, I need to repeat the following for each season:
+
+- use the final ratings for season $t-1$ as the start ratings for season $t$
+  - at some later stage, I'll use shrinkage to bring these back in line
+- load in season $t$ data
+- run through the season and get the final ratings
+- store the aggregated error
+
+That looks good? Let's give it a shot.
+
+#+BEGIN_SRC R :session :exports both :results output
+  ## This is the same function as previously
+  calcEloOpt <- function(rndData, oldRating, K, ha = 0){
+      rndData <- rndData %>%
+          mutate(
+              rOldHome = with(oldRating %>%
+                              filter(team %in% rndData$teamNameHome),
+                              rating),
+              rOldAway = with(oldRating %>%
+                              filter(team %in% rndData$teamNameAway),
+                              rating),
+              diffExpHome = rOldHome - rOldAway + ha,
+              diffExpAway = -diffExpHome,
+              diffHome = pointsHome - pointsAway,
+              diffAway = -diffHome,
+              rNewHome = rOldHome + K * (diffHome - diffExpHome),
+              rNewAway = rOldAway + K * (diffAway - diffExpAway),
+              error = diffHome - diffExpHome
+          )
+      ## Then put back into a stacked (tidy) data frame.
+      nextRating <- with(rndData,
+                         data_frame(round = rep(round, 2),
+                                    team = c(teamNameHome, teamNameAway),
+                                    rating = c(rNewHome, rNewAway)))
+      list(nextRating = nextRating, sqError = sum(rndData$error^2),
+           absError = sum(abs(rndData$error)))
+  }
+
+  ## This is a similar function to the previous optFun, but returns the sum of
+  ## errors (not mean) and also expects the raw parameters (as we have another
+  ## wrapper function).
+  seasonFun <- function(data, initialRating, K, ha){
+      currentRatings <- initialRating
+      oldRating <- currentRatings
+      absErrors <- sqErrors <- array(NA, max(data$round))
+      for(i in seq_len(max(data$round))){
+          rnd <- data %>% filter(round == i)
+          newRating <- calcEloOpt(rnd, oldRating = oldRating, K = K, ha = ha)
+          oldRating <- left_join(oldRating %>%
+                                 select(team, oldRating = rating,
+                                        oldRound = round),
+                                 newRating$nextRating, by = "team") %>%
+              mutate(rating = ifelse(is.na(rating), oldRating, rating),
+                     round = ifelse(is.na(round), oldRound, round)) %>%
+              select(-oldRating, -oldRound)
+          currentRatings <- bind_rows(currentRatings, newRating$nextRating)
+          absErrors[i] <- newRating$absError
+          sqErrors[i] <- newRating$sqError
+      }
+      list(error = sum(sqErrors), finalRating = newRating$nextRating)
+  }
+
+  ## This is where we now optimise
+  optFun <- function(pars, allSeasons, initRating){
+      K <- pars[1]
+      ha <- pars[2]
+      currentRatings <- data_frame(
+          team = unique(c(allSeasons[[1]]$teamNameHome), "GWS Giants",
+                        "Gold Coast Suns"), rating = 1000, round = 0
+      )
+      error <- 0
+      nGames <- 0
+      ## Need to reset round to zero.
+      for(i in seq_along(length(allSeasons))){
+          seasonResults <- seasonFun(allSeasons[[i]], currentRatings,
+                                     K = K, ha = ha)
+          error <- error + seasonResults$error
+          nGames <- nGames + nrow(allSeasons[[i]])
+          currentRatings <- seasonResults$finalRating
+          currentRatings$round <- 0
+      }
+      error/nGames
+  }
+#+END_SRC
+
+* Simple Elo rating
+
+OK, so that has the data in. I'm not even going to look at it yet. Let's jump straight to an Elo-style ranking formula:
+
+\begin{align*}
+R_{n+1} & = R_{n} + K\left(M_{n+1} - E_{n+1}\right) \\
+E_{n+1,h} & = R_{n,h} - R_{n,a} + H
+\end{align*}
+
+where $R_{n}$ is the rating at round $n$; $K$ is a smoothing parameter that controls the amount that ratings change after each game; $M{n}$ is the (points) margin of the game at round $n$; $E_{n,h}$ is the expected margin for the home team; and $H$ is the home team advantage.
+
+The following function calculates this for my data set up:
+
+#+BEGIN_SRC R :session :exports both :results output
+  library(dplyr)
+  library(ggplot2)
+  library(directlabels)
+  load("../data-raw/results-year-2001.rda")
+
+  calcElo <- function(rndData, oldRating, K, ha = 0){
+      rndData <- rndData %>%
+          mutate(
+              rOldHome = with(oldRating %>%
+                              filter(team %in% rndData$teamNameHome),
+                              rating),
+              rOldAway = with(oldRating %>%
+                              filter(team %in% rndData$teamNameAway),
+                              rating),
+              diffExpHome = rOldHome - rOldAway + ha,
+              diffExpAway = -diffExpHome,
+              diffHome = pointsHome - pointsAway,
+              diffAway = -diffHome,
+              rNewHome = rOldHome + K * (diffHome - diffExpHome),
+              rNewAway = rOldAway + K * (diffAway - diffExpAway)
+          )
+      ## Then put back into a stacked (tidy) data frame.
+      nextRating <- with(rndData,
+                         data_frame(round = rep(round, 2),
+                                    team = c(teamNameHome, teamNameAway),
+                                    rating = c(rNewHome, rNewAway)))
+      nextRating
+  }
+#+END_SRC
+
+* Application to season 2001
+
+Let's see how it works in action. First, 2001 is the first season of data I have, so I'll set the initial (round 0) ratings to 1000. Let's look at the ratings after the Grand Final (which is round 26 in this season):
+
+#+BEGIN_SRC R :session :exports both :results output
+  currentRatings <- data_frame(team = unique(results2001$teamNameHome),
+                               rating = 1000,
+                               round = 0
+                               )
+  oldRating <- currentRatings
+  for(i in 1:26){
+      rnd <- results2001 %>% filter(round == i)
+      newRating <- calcElo(rnd, oldRating = oldRating, K = 0.1, ha = 8)
+      oldRating <- left_join(oldRating %>%
+                             select(team, oldRating = rating,
+                                    oldRound = round),
+                             newRating, by = "team") %>%
+          mutate(rating = ifelse(is.na(rating), oldRating, rating),
+                 round = ifelse(is.na(round), oldRound, round)) %>%
+          select(-oldRating, -oldRound)
+      currentRatings <- bind_rows(currentRatings, newRating)
+  }
+  currentRatings %>% filter(round == 26) %>% arrange(desc(rating))
+#+END_SRC
+
+Well, how does that compare to the actual ladder? No idea - here's how the rankings worked out:
+
+#+BEGIN_SRC R :session :exports both :results graphics :file ./img/ratings2001.svg
+  plt <- ggplot(currentRatings, aes(x = round, y = rating, colour = team)) +
+      geom_line() +
+      scale_colour_discrete(guide = "none") +
+      geom_dl(aes(label = team), method = "last.bumpup")
+  print(plt)
+#+END_SRC
+
+#+RESULTS:
+[[file:./img/ratings2001.svg]]
+
+and here's how the final rankings looked (after finals):
+
+#+BEGIN_SRC R :session :exports results :results output
+  oldRating %>% arrange(desc(rating))
+#+END_SRC
+
+Clearly, this is not optimised well (!) Brisbane and Essendon were the finalists, with Brisbane winning the flag:
+
+#+BEGIN_SRC R :session :exports results :results output
+  hm <- results2001 %>% filter(round == 26) %>%
+      select(team = teamNameHome, goals = goalsHome,
+             behinds = behindsHome, points = pointsHome)
+  aw <- results2001 %>% filter(round == 26) %>%
+          select(team = teamNameAway, goals = goalsAway,
+                 behinds = behindsAway, points = pointsAway)
+  bind_rows(hm, aw) %>% ungroup() %>% select(-round)
+#+END_SRC
+
+* Optimisation
+
+Can we optimise? How would we do this? We would do it internally to start with I think. I'm going to define a new function here for this.
+
+#+BEGIN_SRC R :session :exports both :results output
+  calcEloOpt <- function(rndData, oldRating, K, ha = 0){
+      rndData <- rndData %>%
+          mutate(
+              rOldHome = with(oldRating %>%
+                              filter(team %in% rndData$teamNameHome),
+                              rating),
+              rOldAway = with(oldRating %>%
+                              filter(team %in% rndData$teamNameAway),
+                              rating),
+              diffExpHome = rOldHome - rOldAway + ha,
+              diffExpAway = -diffExpHome,
+              diffHome = pointsHome - pointsAway,
+              diffAway = -diffHome,
+              rNewHome = rOldHome + K * (diffHome - diffExpHome),
+              rNewAway = rOldAway + K * (diffAway - diffExpAway),
+              error = diffHome - diffExpHome
+          )
+      ## Then put back into a stacked (tidy) data frame.
+      nextRating <- with(rndData,
+                         data_frame(round = rep(round, 2),
+                                    team = c(teamNameHome, teamNameAway),
+                                    rating = c(rNewHome, rNewAway)))
+      list(nextRating = nextRating, sqError = sum(rndData$error^2),
+           absError = sum(abs(rndData$error)))
+  }
+#+END_SRC
+
+In the function above, I have a new value calculated: ~error~, which is the difference between the actual margin, and the expected margin. The function now returns the ratings, but also two forms of error: squared and absolute.
+
+What does the error look like? The following function can do the optimisation:
+
+#+BEGIN_SRC R :session :exports both :results output
+  optFun <- function(pars, data, initialRating){
+      K <- exp(pars[1])
+      ha <- exp(pars[2])
+      currentRatings <- initialRating
+      oldRating <- currentRatings
+      absErrors <- sqErrors <- array(NA, max(data$round))
+      for(i in seq_len(max(data$round))){
+          rnd <- data %>% filter(round == i)
+          newRating <- calcEloOpt(rnd, oldRating = oldRating, K = K, ha = ha)
+          oldRating <- left_join(oldRating %>%
+                                 select(team, oldRating = rating,
+                                        oldRound = round),
+                                 newRating$nextRating, by = "team") %>%
+              mutate(rating = ifelse(is.na(rating), oldRating, rating),
+                     round = ifelse(is.na(round), oldRound, round)) %>%
+              select(-oldRating, -oldRound)
+          currentRatings <- bind_rows(currentRatings, newRating$nextRating)
+          absErrors[i] <- newRating$absError
+          sqErrors[i] <- newRating$sqError
+      }
+      sum(sqErrors)/nrow(data)
+  }
+#+END_SRC
+
+We can run it like the following:
+
+#+BEGIN_SRC R :exports code :results output
+  initRating <- data_frame(team = unique(results2001$teamNameHome),
+                           rating = 1000,
+                           round = 0
+                           )
+  test <- optim(c(runif(1, log(0.0001), 0), runif(1, 0, 5)), optFun,
+                method = "L-BFGS-B",
+                lower = rep(log(0.0001), 2), upper = c(0, log(50)),
+                data = results2001, initialRating = initRating)
+#+END_SRC
+
+This gives us a value of SRC_R[:session]{exp(test$par[1])} for the smoothing parameter, and SRC_R[:session]{exp(test$par[2])} for the home grand advantage. Feeding those into the ratings system, we get the following end of year rankings:
+
+#+BEGIN_SRC R :session :exports both :results output
+  currentRatings <- data_frame(team = unique(results2001$teamNameHome),
+                               rating = 1000,
+                               round = 0
+                               )
+  oldRating <- currentRatings
+  for(i in 1:26){
+      rnd <- results2001 %>% filter(round == i)
+      newRating <- calcElo(rnd, oldRating = oldRating, K = 0.0001, ha = 3.144875)
+      oldRating <- left_join(oldRating %>%
+                             select(team, oldRating = rating,
+                                    oldRound = round),
+                             newRating, by = "team") %>%
+          mutate(rating = ifelse(is.na(rating), oldRating, rating),
+                 round = ifelse(is.na(round), oldRound, round)) %>%
+          select(-oldRating, -oldRound)
+      currentRatings <- bind_rows(currentRatings, newRating)
+  }
+  oldRating %>% arrange(desc(rating))
+#+END_SRC
+
+#+BEGIN_SRC R :session :exports both :results graphics :file ./img/ratings2001opt.svg
+  plt <- ggplot(currentRatings, aes(x = round, y = rating, colour = team)) +
+      geom_line() +
+      scale_colour_discrete(guide = "none") +
+      geom_dl(aes(label = team), method = "last.bumpup")
+  print(plt)
+#+END_SRC
+
+#+RESULTS:
+[[file:img/ratings2001opt.svg]]
