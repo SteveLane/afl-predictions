@@ -16,12 +16,9 @@ Now let's look at the 2001 data:
 
 #+BEGIN_SRC R :session :exports both :results output
   library(dplyr)
-  library(ggplot2)
-  library(directlabels)
   library(optimx)
   ## Load all data in
-  allSeasons <- lapply(lapply(list.files("../data-raw", full.names = TRUE), load),
-                       get)
+  load("../data-raw/all-seasons.rda")
   ## Remove 2016
   allSeasons <- allSeasons[-16]
 #+END_SRC
@@ -47,7 +44,7 @@ That looks good? Let's give it a shot.
 
 #+BEGIN_SRC R :session :exports both :results output
   ## This is the same function as previously
-  calcEloOpt <- function(rndData, oldRating, K, ha = 0){
+  calcEloOpt <- function(rndData, oldRating, pars){
       rndData <- rndData %>%
           mutate(
               rOldHome = with(oldRating %>%
@@ -56,12 +53,13 @@ That looks good? Let's give it a shot.
               rOldAway = with(oldRating %>%
                               filter(team %in% rndData$teamNameAway),
                               rating),
-              diffExpHome = rOldHome - rOldAway + ha,
+              diffExpHome = rOldHome - rOldAway + exp(pars[2]),
               diffExpAway = -diffExpHome,
               diffHome = pointsHome - pointsAway,
               diffAway = -diffHome,
-              rNewHome = rOldHome + K * (diffHome - diffExpHome),
-              rNewAway = rOldAway + K * (diffAway - diffExpAway),
+              rChange = exp(pars[1]) * (diffHome - diffExpHome),
+              rNewHome = rOldHome + rChange,
+              rNewAway = rOldAway - rChange,
               error = diffHome - diffExpHome
           )
       ## Then put back into a stacked (tidy) data frame.
@@ -76,13 +74,16 @@ That looks good? Let's give it a shot.
   ## This is a similar function to the previous optFun, but returns the sum of
   ## errors (not mean) and also expects the raw parameters (as we have another
   ## wrapper function).
-  seasonFun <- function(data, initialRating, K, ha){
+  seasonFun <- function(data, initialRating, pars, system){
       currentRatings <- initialRating
       oldRating <- currentRatings
       absErrors <- sqErrors <- array(NA, max(data$round))
       for(i in seq_len(max(data$round))){
           rnd <- data %>% filter(round == i)
-          newRating <- calcEloOpt(rnd, oldRating = oldRating, K = K, ha = ha)
+          newRating <- switch(
+              system,
+              simpElo = calcEloOpt(rnd, oldRating = oldRating, pars = pars)
+          )
           oldRating <- left_join(oldRating %>%
                                  select(team, oldRating = rating,
                                         oldRound = round),
@@ -98,9 +99,7 @@ That looks good? Let's give it a shot.
   }
 
   ## This is where we now optimise
-  optFun <- function(pars, allSeasons){
-      K <- exp(pars[1])
-      ha <- exp(pars[2])
+  optFun <- function(pars, allSeasons, system){
       currentRatings <- data_frame(
           team = c(unique(allSeasons[[1]]$teamNameHome), "GWS Giants",
                    "Gold Coast Suns"), rating = 1000, round = 0
@@ -109,8 +108,8 @@ That looks good? Let's give it a shot.
       nGames <- 0
       ## Need to reset round to zero.
       for(i in seq_len(length(allSeasons))){
-          seasonResults <- seasonFun(allSeasons[[i]], currentRatings,
-                                     K = K, ha = ha)
+          seasonResults <- seasonFun(allSeasons[[i]], currentRatings, pars = pars,
+                                     system = system)
           error <- error + seasonResults$error
           nGames <- nGames + nrow(allSeasons[[i]])
           currentRatings <- seasonResults$finalRating
@@ -127,7 +126,8 @@ This is going to take a while...
 #+BEGIN_SRC R :exports both :results output
   aflOpt <- optimx(c(runif(1, log(0.0001), 0), runif(1, 0, 5)), optFun,
                    method = "L-BFGS-B", lower = rep(log(0.0001), 2),
-                   upper = c(0, log(50)),  allSeasons = allSeasons)
+                   upper = c(0, log(50)),  allSeasons = allSeasons,
+                   system = "simpElo")
 #+END_SRC
 
 Problem is, it sets $K=0.001$ and $H = 8.015929$. $K$ is way too small. This is likely due to my dodgy Elo rating though!
