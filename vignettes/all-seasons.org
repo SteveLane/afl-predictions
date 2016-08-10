@@ -40,7 +40,7 @@ OK now, I need to repeat the following for each season:
 - run through the season and get the final ratings
 - store the aggregated error
 
-That looks good? Let's give it a shot.
+That looks good? Let's give it a shot. The calculation used previously didn't model probabilities, and so was quite different from anything else. I need to reconfigure the Elo calculation:
 
 #+BEGIN_SRC R :session :exports both :results output
   ## This is the same function as previously
@@ -53,22 +53,22 @@ That looks good? Let's give it a shot.
               rOldAway = with(oldRating %>%
                               filter(team %in% rndData$teamNameAway),
                               rating),
+              ## Now, what is the probability of a win? Let's use the original Elo
+              ## curve:
               diffExpHome = rOldHome - rOldAway + exp(pars[2]),
-              diffExpAway = -diffExpHome,
-              diffHome = pointsHome - pointsAway,
-              diffAway = -diffHome,
-              rChange = exp(pars[1]) * (diffHome - diffExpHome),
+              pExpHome = 1/(10^(-diffExpHome/exp(pars[3])) + 1),
+              winHome = (pointsHome - pointsAway) > 0,
+              rChange = exp(pars[1]) * (winHome - pExpHome),
               rNewHome = rOldHome + rChange,
               rNewAway = rOldAway - rChange,
-              error = diffHome - diffExpHome
+              logScore = winHome*log(pExpHome) + (1 - winHome)*log(1 - pExpHome)
           )
       ## Then put back into a stacked (tidy) data frame.
       nextRating <- with(rndData,
                          data_frame(round = rep(round, 2),
                                     team = c(teamNameHome, teamNameAway),
                                     rating = c(rNewHome, rNewAway)))
-      list(nextRating = nextRating, sqError = sum(rndData$error^2),
-           absError = sum(abs(rndData$error)))
+      list(nextRating = nextRating, logScore = sum(rndData$logScore))
   }
 
   ## This is a similar function to the previous optFun, but returns the sum of
@@ -77,7 +77,7 @@ That looks good? Let's give it a shot.
   seasonFun <- function(data, initialRating, pars, system){
       currentRatings <- initialRating
       oldRating <- currentRatings
-      absErrors <- sqErrors <- array(NA, max(data$round))
+      logScore <- array(NA, max(data$round))
       for(i in seq_len(max(data$round))){
           rnd <- data %>% filter(round == i)
           newRating <- switch(
@@ -92,10 +92,9 @@ That looks good? Let's give it a shot.
                      round = ifelse(is.na(round), oldRound, round)) %>%
               select(-oldRating, -oldRound)
           currentRatings <- bind_rows(currentRatings, newRating$nextRating)
-          absErrors[i] <- newRating$absError
-          sqErrors[i] <- newRating$sqError
+          logScore[i] <- newRating$logScore
       }
-      list(error = sum(sqErrors), finalRating = oldRating)
+      list(error = sum(logScore), finalRating = oldRating)
   }
 
   ## This is where we now optimise
@@ -124,10 +123,10 @@ That looks good? Let's give it a shot.
 This is going to take a while...
 
 #+BEGIN_SRC R :exports both :results output
-  aflOpt <- optimx(c(runif(1, log(0.0001), 0), runif(1, 0, 5)), optFun,
-                   method = "L-BFGS-B", lower = rep(log(0.0001), 2),
-                   upper = c(0, log(50)),  allSeasons = allSeasons,
-                   system = "simpElo")
+  aflOpt <- optimx(runif(3, 0, 5), optFun,
+                   method = "L-BFGS-B", lower = rep(0, 3),
+                   allSeasons = allSeasons, system = "simpElo",
+                   control = list(maximize = TRUE))
 #+END_SRC
 
-Problem is, it sets $K=0.001$ and $H = 8.015929$. $K$ is way too small. This is likely due to my dodgy Elo rating though!
+Problem is, it sets $K=0.00645236$ and $H = 52.7273$. $K$ is way too small. This is likely due to my dodgy Elo rating though!
